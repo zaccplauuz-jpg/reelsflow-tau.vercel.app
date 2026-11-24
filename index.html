@@ -1,0 +1,101 @@
+
+const crypto = require("crypto");
+const { creds, getUser, sign } = require("../helpers");
+
+const COOKIE_NAME = "ig_oauth_state";
+const COOKIE_PATH = "/api/instagram";
+const STATE_TTL = 10 * 60 * 1000;
+
+module.exports = async (req, res) => {
+  if (req.method !== "POST") {
+    return res.status(405).json({
+      error: "Método não permitido."
+    });
+  }
+
+  try {
+    const config = creds();
+
+    const appId = config.appId;
+    const appSecret = config.appSecret;
+    const redirectUri = config.redirectUri;
+    const configId = config.configId;
+
+    if (!appId || !appSecret || !redirectUri || !configId) {
+      return res.status(500).json({
+        error: "Configuração da Meta incompleta no servidor."
+      });
+    }
+
+    const authorization = req.headers.authorization || "";
+    const accessToken = authorization.startsWith("Bearer ")
+      ? authorization.slice(7)
+      : req.body && req.body.access_token;
+
+    if (!accessToken) {
+      return res.status(401).json({
+        error: "Faça login no Reels Manager novamente."
+      });
+    }
+
+    const user = await getUser(accessToken);
+
+    if (!user || !user.id) {
+      return res.status(401).json({
+        error: "Sessão do Reels Manager inválida ou expirada."
+      });
+    }
+
+    const instagramUsername = String(
+      req.body?.instagram_username || ""
+    )
+      .trim()
+      .replace(/^@/, "")
+      .toLowerCase();
+
+    if (!/^[a-z0-9._]{1,30}$/.test(instagramUsername)) {
+      return res.status(400).json({
+        error: "Informe um nome de usuário Instagram válido."
+      });
+    }
+
+    const statePayload = {
+      userId: user.id,
+      instagramUsername,
+      nonce: crypto.randomBytes(16).toString("hex"),
+      iat: Date.now()
+    };
+
+    const payload = Buffer
+      .from(JSON.stringify(statePayload))
+      .toString("base64url");
+
+    const state = `${payload}.${sign(payload, appSecret)}`;
+
+    res.setHeader(
+      "Set-Cookie",
+      `${COOKIE_NAME}=${state}; HttpOnly; Secure; SameSite=Lax; Path=${COOKIE_PATH}; Max-Age=${STATE_TTL / 1000}`
+    );
+
+    const params = new URLSearchParams({
+      client_id: appId,
+      redirect_uri: redirectUri,
+      config_id: configId,
+      response_type: "code",
+      override_default_response_type: "true",
+      state
+    });
+
+    const url =
+      `https://www.facebook.com/dialog/oauth?${params.toString()}`;
+
+    return res.status(200).json({ url });
+
+  } catch (error) {
+    console.error("Instagram auth:", error.message);
+
+    return res.status(500).json({
+      error: "Não foi possível iniciar a conexão com o Instagram."
+    });
+  }
+};

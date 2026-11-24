@@ -1,1 +1,477 @@
 
+const { getUser, db } = require("../helpers");
+
+function sendError(res, status, message) {
+  return res.status(status).json({ error: message });
+}
+
+function getId(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+async function authenticate(req) {
+  const authorization = req.headers.authorization || "";
+
+  if (!authorization.startsWith("Bearer ")) {
+    return null;
+  }
+
+  return getUser(authorization.slice(7));
+}
+
+// Busca todos os registros em páginas para não parar no limite padrão
+// de 1.000 linhas do Supabase. A ordenação por id mantém as páginas estáveis.
+async function getAllRows(path, pageSize = 500) {
+  const allRows = [];
+  let offset = 0;
+
+  while (true) {
+    const page = await db(path, {
+      method: "GET",
+      headers: {
+        Range: `${offset}-${offset + pageSize - 1}`,
+        "Range-Unit": "items"
+      }
+    });
+
+    const rows = Array.isArray(page) ? page : [];
+    allRows.push(...rows);
+
+    if (rows.length < pageSize) {
+      break;
+    }
+
+    offset += pageSize;
+  }
+
+  return allRows;
+}
+
+async function getWorkspaceVideos(userId) {
+  const rows = await db(
+    "user_workspace?select=workspace&user_id=eq." +
+      encodeURIComponent(userId),
+    { method: "GET" }
+  );
+
+  const workspace = Array.isArray(rows) ? rows[0]?.workspace : null;
+
+  return Array.isArray(workspace?.videos) ? workspace.videos : [];
+}
+
+async function getOrCreateVideo(ownerId, videoId) {
+  // Primeiro, procura o vídeo na tabela oficial.
+  const existingRows = await db(
+    "videos?select=id,owner_id,title,storage_path,duration_seconds" +
+      "&id=eq." + encodeURIComponent(videoId) +
+      "&owner_id=eq." + encodeURIComponent(ownerId),
+    { method: "GET" }
+  );
+
+  const existing = Array.isArray(existingRows)
+    ? existingRows[0]
+    : null;
+
+  if (existing) {
+    if (!existing.storage_path) {
+      throw new Error("O vídeo cadastrado não possui caminho no Storage.");
+    }
+
+    return existing;
+  }
+
+  // Se não existir, procura na biblioteca do usuário.
+  const workspaceVideos = await getWorkspaceVideos(ownerId);
+
+  const workspaceVideo = workspaceVideos.find(
+    item => String(item.id) === String(videoId)
+  );
+
+  if (!workspaceVideo || !workspaceVideo.path) {
+    return null;
+  }
+
+  // Registra o vídeo na tabela exigida pelo agendamento.
+  const insertedRows = await db("videos", {
+    method: "POST",
+    headers: {
+      Prefer: "return=representation"
+    },
+    body: JSON.stringify({
+      id: videoId,
+      owner_id: ownerId,
+      title: workspaceVideo.title || workspaceVideo.fileName || "Vídeo",
+      storage_path: workspaceVideo.path,
+      duration_seconds: null
+    })
+  });
+
+  const saved = Array.isArray(insertedRows)
+    ? insertedRows[0]
+    : insertedRows;
+
+  if (!saved?.id) {
+    throw new Error("Não foi possível cadastrar o vídeo na tabela videos.");
+  }
+
+  return saved;
+}
+
+module.exports = async (req, res) => {
+  try {
+    const user = await authenticate(req);
+
+    if (!user?.id) {
+      return sendError(
+        res,
+        401,
+        "Sessão inválida ou expirada. Entre novamente."
+      );
+    }
+
+    const ownerId = user.id;
+
+    // EXCLUSÕES DA FILA: cada operação é limitada ao usuário autenticado.
+    if (req.method === "DELETE") {
+      let body = req.body || {};
+      if (typeof body === "string") {
+        try { body = JSON.parse(body); }
+        catch { return sendError(res, 400, "Dados enviados inválidos."); }
+      }
+
+      // Apaga em lote somente itens que ainda aguardam publicação.
+      // Publicados, falhos e em processamento são preservados.
+      if (body.action === "delete_all_pending") {
+        // Percorre todas as páginas: a consulta REST simples pode parar em 1.000 linhas.
+        const rows = await getAllRows(
+          "scheduled_posts?select=id,status&owner_id=eq." +
+            encodeURIComponent(ownerId) +
+            "&order=id.asc"
+        );
+        const protectedStatuses = new Set([
+          "published", "publicado", "failed", "falhou",
+          "processing", "publicando", "in_progress"
+        ]);
+        const ids = rows
+          .filter(item => !protectedStatuses.has(
+            String(item.status || "").trim().toLowerCase()
+          ))
+          .map(item => getId(item.id))
+          .filter(Boolean);
+
+        if (ids.length === 0) {
+          return res.status(200).json({ success: true, deletedCount: 0 });
+        }
+
+        // Exclui em lotes pequenos para evitar URLs muito grandes.
+        let deletedCount = 0;
+        for (let index = 0; index < ids.length; index += 100) {
+          const batch = ids.slice(index, index + 100);
+          const deleted = await db(
+            "scheduled_posts?owner_id=eq." + encodeURIComponent(ownerId) +
+              "&id=in.(" + batch.map(encodeURIComponent).join(",") + ")",
+            {
+              method: "DELETE",
+              headers: { Prefer: "return=representation" }
+            }
+          );
+
+          if (!Array.isArray(deleted)) {
+            throw new Error("O Supabase não confirmou a exclusão dos agendamentos.");
+          }
+          deletedCount += deleted.length;
+        }
+
+        return res.status(200).json({
+          success: true,
+          deletedCount
+        });
+      }
+
+      // REMOVE A CONEXÃO SEM APAGAR O HISTÓRICO DA CONTA.
+      const accountId = getId(body.accountId);
+      if (accountId) {
+        const updated = await db(
+          "instagram_accounts?owner_id=eq." + encodeURIComponent(ownerId) +
+            "&id=eq." + encodeURIComponent(accountId),
+          {
+            method: "PATCH",
+            headers: { Prefer: "return=representation" },
+            body: JSON.stringify({ is_hidden: true, access_token: "" })
+          }
+        );
+
+        if (!Array.isArray(updated) || updated.length === 0) {
+          return sendError(res, 404, "Conta não encontrada ou você não tem permissão para removê-la.");
+        }
+
+        // Cancela somente itens ainda agendados; publicados e falhos permanecem no histórico.
+        await db(
+          "scheduled_posts?owner_id=eq." + encodeURIComponent(ownerId) +
+            "&instagram_account_id=eq." + encodeURIComponent(accountId) +
+            "&status=eq.scheduled",
+          { method: "DELETE" }
+        );
+
+        return res.status(200).json({ success: true });
+      }
+
+      // REMOVER UM ÚNICO AGENDAMENTO.
+      const id = getId(req.query?.id);
+      if (id) {
+        const deleted = await db(
+          "scheduled_posts?owner_id=eq." + encodeURIComponent(ownerId) +
+            "&id=eq." + encodeURIComponent(id),
+          {
+            method: "DELETE",
+            headers: { Prefer: "return=representation" }
+          }
+        );
+
+        if (!Array.isArray(deleted) || deleted.length === 0) {
+          return sendError(res, 404, "Agendamento não encontrado.");
+        }
+
+        return res.status(200).json({ success: true });
+      }
+
+      return sendError(res, 400, "Informe a conta ou o agendamento que deseja remover.");
+    }
+
+    // LISTAR AGENDAMENTOS
+    if (req.method === "GET") {
+      // select=* evita que uma coluna opcional ausente faça a consulta inteira
+      // falhar. A fila já existe em instalações com os formatos atual e legado.
+      const schedules = await getAllRows(
+        "scheduled_posts?select=*&owner_id=eq." +
+          encodeURIComponent(ownerId) +
+          "&order=id.asc"
+      );
+      if (schedules.length === 0) {
+        return res.status(200).json({ schedules: [] });
+      }
+
+      // Os registros antigos já guardam username e video_title. Os novos
+      // usam IDs e podem precisar complementar esses dados pelas tabelas.
+      const needsAccountLookup = schedules.some(
+        item => item.instagram_account_id && !item.username
+      );
+      const needsVideoLookup = schedules.some(
+        item => item.video_id && !item.video_title
+      );
+
+      let accountMap = new Map();
+      let videoMap = new Map();
+
+      if (needsAccountLookup) {
+        try {
+          const accounts = await db(
+            "instagram_accounts?select=id,username&owner_id=eq." +
+              encodeURIComponent(ownerId),
+            { method: "GET" }
+          );
+          accountMap = new Map(
+            (Array.isArray(accounts) ? accounts : []).map(account => [
+              account.id,
+              account.username
+            ])
+          );
+        } catch (lookupError) {
+          console.warn("Não foi possível complementar nomes das contas:", lookupError.message);
+        }
+      }
+
+      if (needsVideoLookup) {
+        try {
+          const videos = await db(
+            "videos?select=id,title&owner_id=eq." +
+              encodeURIComponent(ownerId),
+            { method: "GET" }
+          );
+          videoMap = new Map(
+            (Array.isArray(videos) ? videos : []).map(video => [
+              video.id,
+              video.title
+            ])
+          );
+        } catch (lookupError) {
+          console.warn("Não foi possível complementar nomes dos vídeos:", lookupError.message);
+        }
+      }
+
+      const result = schedules
+        .map(item => ({
+          id: item.id,
+          instagram_account_id: item.instagram_account_id || null,
+          video_id: item.video_id || null,
+          scheduled_at: item.scheduled_for || item.scheduled_at || null,
+          status: item.status || "scheduled",
+          username:
+            item.username ||
+            accountMap.get(item.instagram_account_id) ||
+            item.instagram_user_id ||
+            "Instagram",
+          video_title:
+            item.video_title ||
+            videoMap.get(item.video_id) ||
+            "Vídeo",
+          caption: item.caption || "",
+          permalink: "",
+          error_message: item.error_message || ""
+        }))
+        .sort((a, b) => {
+          const dateA = new Date(a.scheduled_at || 0).getTime();
+          const dateB = new Date(b.scheduled_at || 0).getTime();
+          return dateA - dateB;
+        });
+
+      return res.status(200).json({ schedules: result });
+    }
+
+    // CRIAR AGENDAMENTO
+    if (req.method === "POST") {
+      let body = req.body || {};
+
+      if (typeof body === "string") {
+        try {
+          body = JSON.parse(body);
+        } catch {
+          return sendError(res, 400, "Dados enviados inválidos.");
+        }
+      }
+
+      const accountId = getId(body.accountId);
+      const videoId = getId(body.videoId);
+      const scheduledAt = getId(body.scheduledAt);
+      const caption =
+        typeof body.caption === "string" ? body.caption.trim() : "";
+
+      if (!accountId || !videoId || !scheduledAt) {
+        return sendError(
+          res,
+          400,
+          "Informe a conta, o vídeo e a data do agendamento."
+        );
+      }
+
+      if (caption.length > 2200) {
+        return sendError(
+          res,
+          400,
+          "A legenda não pode ultrapassar 2.200 caracteres."
+        );
+      }
+
+      const date = new Date(scheduledAt);
+
+      if (Number.isNaN(date.getTime()) || date <= new Date()) {
+        return sendError(
+          res,
+          400,
+          "Escolha uma data e hora futuras."
+        );
+      }
+
+      const accountRows = await db(
+        "instagram_accounts?select=id,username,connection_status&owner_id=eq." +
+          encodeURIComponent(ownerId) +
+          "&id=eq." +
+          encodeURIComponent(accountId),
+        { method: "GET" }
+      );
+
+      const account = Array.isArray(accountRows)
+        ? accountRows[0]
+        : null;
+
+      if (!account) {
+        return sendError(
+          res,
+          404,
+          "Conta do Instagram não encontrada."
+        );
+      }
+
+      if (account.connection_status !== "connected") {
+        return sendError(
+          res,
+          400,
+          "Conecte a conta do Instagram antes de agendar."
+        );
+      }
+
+      const video = await getOrCreateVideo(ownerId, videoId);
+
+      if (!video) {
+        return sendError(
+          res,
+          404,
+          "Vídeo não encontrado na biblioteca deste usuário."
+        );
+      }
+
+      const now = new Date().toISOString();
+
+      const inserted = await db("scheduled_posts", {
+        method: "POST",
+        headers: {
+          Prefer: "return=representation"
+        },
+        body: JSON.stringify({
+          owner_id: ownerId,
+          video_id: video.id,
+          instagram_account_id: accountId,
+          scheduled_for: date.toISOString(),
+          caption,
+          status: "scheduled",
+          created_at: now
+        })
+      });
+
+      const saved = Array.isArray(inserted)
+        ? inserted[0]
+        : inserted;
+
+      // Nunca informar sucesso sem confirmação de que o Supabase criou a linha.
+      if (!saved?.id) {
+        console.error(
+          "Agendamento sem confirmação de inserção no Supabase:",
+          { ownerId, accountId, videoId: video.id }
+        );
+        return sendError(
+          res,
+          500,
+          "O Supabase não confirmou o salvamento do agendamento. Atualize o painel e tente novamente; nenhum sucesso foi confirmado."
+        );
+      }
+
+      return res.status(201).json({
+        success: true,
+        schedule: {
+          id: saved?.id || null,
+          instagram_account_id: accountId,
+          video_id: video.id,
+          scheduled_at: date.toISOString(),
+          status: "scheduled",
+          username: account.username,
+          video_title: video.title,
+          caption,
+          permalink: "",
+          error_message: ""
+        }
+      });
+    }
+
+    res.setHeader("Allow", "GET, POST, DELETE");
+
+    return sendError(res, 405, "Método não permitido.");
+  } catch (error) {
+    console.error("Instagram schedule API:", error.message);
+
+    return sendError(
+      res,
+      500,
+      "Erro ao processar agendamentos: " + error.message
+    );
+  }
+};
